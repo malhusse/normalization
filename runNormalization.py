@@ -2,8 +2,6 @@
 # and output a normalized T2w dicom series or mha file
 
 import os
-from re import X
-from statistics import linear_regression
 import SimpleITK as sitk
 import argparse
 from norm_helpers import *

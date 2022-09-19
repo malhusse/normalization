@@ -239,13 +239,8 @@ def plot_spline_curve(CaseType, interp_function, true_ints_dict, output_folder=N
 
 def plot_linreg_curve(CaseType, linereg_result, true_ints_dict, output_folder=None, min_value=0):
     
-    shifted_ints_dict = {}
-    
-    for label, value in true_ints_dict.items():
-        shifted_ints_dict[label] = value * linereg_result.slope + linereg_result.intercept
-
     for name in true_ints_dict.keys():
-        plt.scatter(true_ints_dict[name], shifted_ints_dict[name], label=name)
+        plt.scatter(true_ints_dict[name], global_intensities[name], label=name)
 
     # interpolate the curve across the intensity spectrum
     # x_min = min(true_ints_dict.values())
@@ -253,7 +248,7 @@ def plot_linreg_curve(CaseType, linereg_result, true_ints_dict, output_folder=No
     x_max = max(true_ints_dict.values())*1.2
     #  Create the plotting axes of the plot.
     x_vals = np.arange(x_min, x_max, .1)
-    y_vals = (x_vals * linereg_result.slope + linereg_result.intercet).clip(min=0)
+    y_vals = (x_vals * linereg_result.slope + linereg_result.intercept).clip(min=0)
     plt.plot(x_vals, y_vals)
     # Add labels, clean up, make pretty, and save.
     plt.xlabel('T2 Intensities original', fontsize=20)
