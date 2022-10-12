@@ -1,39 +1,29 @@
 import os
-import sys
-import json
-import datetime
 import numpy as np
-import skimage.io
-from imgaug import augmenters as iaa
 import SimpleITK as sitk
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from scipy import interpolate
 from scipy.stats import trim_mean
-import cv2
+
 import time
 
 # Root directory of the project
 # sys.path.append('MaskRCNN')  # To find local version of the library
 from mrcnn.config import Config
-from mrcnn import utils
 from mrcnn import model as modellib
-from mrcnn import visualize
 
 import numpy as np
-from PIL import Image
 import os
-import csv
 import nrrd
-import re
-from collections import Counter
 
 ###################################
 ## Image Helpers ##################
 ###################################
-def read_input(sitk_reader, input_folder):
-    t2w_dicoms = sitk_reader.GetGDCMSeriesFileNames(input_folder)
+def read_input(sitk_reader, input_folder, patient):
+    t2w_path = os.path.abspath(os.path.join(input_folder, patient))
+    t2w_dicoms = sitk_reader.GetGDCMSeriesFileNames(t2w_path)
         
     sitk_reader.SetFileNames(t2w_dicoms)
     sitk_reader.MetaDataDictionaryArrayUpdateOn()
@@ -134,19 +124,39 @@ def write_dicom_series(sitk_reader, orig_img, mod_img_arr, sitk_writer, output_p
         sitk_writer.SetFileName(os.path.join(output_path, str(i) + '.dcm'))
         sitk_writer.Execute(image_slice)
 
-def write_mha_file(sitk_reader, orig_img, mod_img_arr, sitk_writer, output_path, name='T2.mha'):
+def write_mha_file(sitk_reader, orig_img, mod_img_arr, sitk_writer, output_path):
+    modification_time = time.strftime("%H%M%S")
+    modification_date = time.strftime("%Y%m%d")
+    direction = orig_img.GetDirection()
+    series_tag_values = [
+                        (k, sitk_reader.GetMetaData(0, k))
+                        for k in tags_to_copy
+                        if sitk_reader.HasMetaDataKey(0, k)] + \
+                    [("0008|0031", modification_time),  # Series Time
+                     ("0008|0021", modification_date),  # Series Date
+                     ("0008|0008", "DERIVED\\SECONDARY"),  # Image Type
+                     ("0020|000e", "1.2.826.0.1.3680043.2.1125." +
+                      modification_date + ".1" + modification_time),
+                     # Series Instance UID
+                     ("0020|0037",
+                      '\\'.join(map(str, (direction[0], direction[3],
+                                          direction[6],
+                                          # Image Orientation (Patient)
+                                          direction[1], direction[4],
+                                          direction[7])))),
+                     ("0008|103e",
+                      sitk_reader.GetMetaData(0, "0008|103e")
+                      # Series Description
+                      + " Processed-Spline-Normalized")]
+    
     mod_img = sitk.Cast(sitk.GetImageFromArray(mod_img_arr), sitk.sitkUInt16)
     mod_img.SetOrigin(orig_img.GetOrigin())
     mod_img.SetSpacing(orig_img.GetSpacing())
-    mod_img.SetDirection(orig_img.GetDirection())
+    for tag, value in series_tag_values:
+            mod_img.SetMetaData(tag, value)
     
-    # Write Normalized image
-    sitk_writer.SetFileName(os.path.join(output_path, name))
+    sitk_writer.SetFileName(os.path.join(output_path, 't2w.mha'))
     sitk_writer.Execute(mod_img)
-
-    # Write Original image
-    #sitk_writer.SetFileName(os.path.join(output_path, 'T2-Original.mha'))
-    #sitk_writer.Execute(orig_img)
 
 ###################################
 ## Normalization Helpers ##########
@@ -165,49 +175,52 @@ def get_intensities(input_image_arr, volume_masks):
     # true_ints, target_ints = [0], [0]
     true_ints, target_ints = [], []
 
+    CaseType = 0
+    if len(true_ints_dict) > 2:
+        G = true_ints_dict['GM']
+        F = true_ints_dict['Femur']
+        B = true_ints_dict['Bladder']
 
-    G = true_ints_dict['GM']
-    F = true_ints_dict['Femur']
-    B = true_ints_dict['Bladder']
+        # Case 1; Correct case
+        CaseType = 1
+        #if (G < F < B):
+            # true_ints_dict.pop('Femur')
 
-    # Case 1; Correct case
-    CaseType = 1
-    #if (G < F < B):
-        # true_ints_dict.pop('Femur')
+        # Case 2: GBF -> Remove Femur
+        if (G < B < F):
+            true_ints_dict.pop('Femur')
+            CaseType = 2
 
-    # Case 2: GBF -> Remove Femur
-    if (G < B < F):
-        true_ints_dict.pop('Femur')
-        CaseType = 2
+        # Case 3: FGB -> Remove Femur
+        if (F < G < B):
+            true_ints_dict.pop('Femur')
+            CaseType = 3
 
-    # Case 3: FGB -> Remove Femur
-    if (F < G < B):
-        true_ints_dict.pop('Femur')
-        CaseType = 3
+        # Case 4: FBG -> Remove GM
+        if (F < B < G):
+            true_ints_dict.pop('GM')
+            CaseType = 4
 
-    # Case 4: FBG -> Remove GM
-    if (F < B < G):
-        true_ints_dict.pop('GM')
-        CaseType = 4
-
-    # Case 5: BFG -> Error
-    if (B < F < G): # This is an error
-        true_ints_dict.pop('Bladder')
-        true_ints_dict.pop('GM')
-        CaseType = 5
-        
-    # Case 6
-    if (B < G < F):
-        true_ints_dict.pop('Bladder')
-        CaseType = 6
+        # Case 5: BFG -> Error
+        if (B < F < G): # This is an error
+            true_ints_dict.pop('Bladder')
+            true_ints_dict.pop('GM')
+            CaseType = 5
+            
+        # Case 6
+        if (B < G < F):
+            true_ints_dict.pop('Bladder')
+            CaseType = 6
 
 
-    # Step: Convert values to a list
+        # Step: Convert values to a list
     for label, label_int in true_ints_dict.items():
         true_ints.append(label_int)
         target_ints.append(global_intensities[label])
 
     return true_ints_dict, true_ints, target_ints, CaseType
+
+
 
 def plot_spline_curve(CaseType, interp_function, true_ints_dict, output_folder=None, min_value=0):
     
@@ -374,7 +387,7 @@ def get_mrcnn_model():
 
     return mrcnn_model
 
-def feed_image_to_mrcnn(mrcnn_model, input_img_arr, debug_folder, debug):
+def feed_image_to_mrcnn(mrcnn_model, patient, input_img_arr, debug_folder, debug):
     volume_masks = np.zeros((input_img_arr.shape[0], len(class_legend)+1, input_img_arr.shape[1], input_img_arr.shape[2]))
     
     for i, t2w_slice in enumerate(input_img_arr):
@@ -397,15 +410,15 @@ def feed_image_to_mrcnn(mrcnn_model, input_img_arr, debug_folder, debug):
 
             t2w_slice_masks = np.clip(t2w_slice_masks, 0, 1)
 
-            if debug:
-                if np.any(t2w_slice_masks):
-                    # TODO: lower the opacity of the overlayed masks (~alpha=.4?)
-                    visualize.display_instances(np.stack((t2w_slice,)*3, axis=-1), mrcnn_output['rois'], mrcnn_output['masks'],
-                                                mrcnn_output['class_ids'], class_names, mrcnn_output['scores'])
+            # if debug:
+            #     if np.any(t2w_slice_masks):
+            #         # TODO: lower the opacity of the overlayed masks (~alpha=.4?)
+            #         visualize.display_instances(np.stack((t2w_slice,)*3, axis=-1), mrcnn_output['rois'], mrcnn_output['masks'],
+            #                                     mrcnn_output['class_ids'], class_names, mrcnn_output['scores'])
 
                     
-                    plt.savefig(os.path.join(debug_folder, 'MRCNN_OUTPUT', 'OVERLAY_SLICE_{}.png'.format(i)), dpi=320)
-                    plt.close()
+            #         plt.savefig(os.path.join(debug_folder, 'MRCNN_OUTPUT', patient, 'OVERLAY_SLICE_{}.png'.format(i)), dpi=320)
+            #         plt.close()
 
             volume_masks[i] = t2w_slice_masks
 
@@ -413,7 +426,7 @@ def feed_image_to_mrcnn(mrcnn_model, input_img_arr, debug_folder, debug):
         
     if debug:
         for i in range(1, volume_masks.shape[1]):
-            nrrd.write(os.path.join(debug_folder, 'MRCNN_OUTPUT', '{}.nrrd'.format(array_idx_legend[i])), volume_masks[:,i,:,:])
+            sitk.WriteImage(sitk.GetImageFromArray(volume_masks[:,i,:,:]), os.path.join(debug_folder, 'MRCNN_OUTPUT', patient, '{}.nii.gz'.format(array_idx_legend[i])))
 
     return volume_masks
 
